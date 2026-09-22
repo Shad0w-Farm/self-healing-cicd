@@ -1,0 +1,106 @@
+name: Self-Heal
+
+# Fires automatically when CI concludes in failure. Pulls the failed run's logs,
+# runs RCA, and takes the strategy's action: rerun / fix-forward / revert / investigate.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+permissions:
+  contents: write        # commit fixes / open revert branches
+  actions: write         # re-run failed CI
+  issues: write          # open RCA issues
+  pull-requests: write   # open fix/revert PRs
+
+jobs:
+  heal:
+    if: ${{ github.event.workflow_run.conclusion == 'failure' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_branch }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Pull the failed run's logs for RCA.
+      - name: Download failed logs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run view ${{ github.event.workflow_run.id }} --log-failed > failed.log 2>&1 || \
+            gh run view ${{ github.event.workflow_run.id }} --log > failed.log 2>&1 || \
+            echo "no logs" > failed.log
+
+      - name: Root-cause analysis
+        id: rca
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python scripts/rca.py failed.log
+
+      # Strategy: RERUN — transient/flaky, just retry CI.
+      - name: Heal — rerun
+        if: ${{ steps.rca.outputs.strategy == 'rerun' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Transient failure — re-running CI."
+          gh run rerun ${{ github.event.workflow_run.id }} --failed
+
+      # Strategy: FIX FORWARD — lint/format, apply the formatter and commit.
+      - name: Heal — fix forward (auto-format)
+        if: ${{ steps.rca.outputs.strategy == 'fix_forward' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          pip install ruff==0.8.6
+          ruff format .
+          ruff check --fix . || true
+          git config user.name "heal-bot"
+          git config user.email "heal-bot@users.noreply.github.com"
+          BRANCH="heal/fix-forward-${{ github.event.workflow_run.head_sha }}"
+          git checkout -b "$BRANCH"
+          git commit -am "fix(heal): auto-format to clear lint failure" || { echo "nothing to fix"; exit 0; }
+          git push origin "$BRANCH"
+          gh pr create --title "🩹 Self-heal: auto-format fix" \
+            --body "Automated fix-forward. RCA: ${{ steps.rca.outputs.reason }}" \
+            --base "${{ github.event.workflow_run.head_branch }}" --head "$BRANCH"
+
+      # Strategy: REVERT — real bug/bad dependency, revert culprit via PR.
+      - name: Heal — revert culprit
+        if: ${{ steps.rca.outputs.strategy == 'revert' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "heal-bot"
+          git config user.email "heal-bot@users.noreply.github.com"
+          SHA="${{ github.event.workflow_run.head_sha }}"
+          BRANCH="heal/revert-${SHA}"
+          git checkout -b "$BRANCH"
+          if git revert --no-edit "$SHA"; then
+            git push origin "$BRANCH"
+            gh pr create --title "🩹 Self-heal: revert failing commit ${SHA:0:7}" \
+              --body "Automated revert. RCA category: ${{ steps.rca.outputs.category }}. ${{ steps.rca.outputs.reason }}" \
+              --base "${{ github.event.workflow_run.head_branch }}" --head "$BRANCH"
+          else
+            echo "Revert not clean — escalating to issue instead."
+            gh issue create --title "⚠️ Self-heal could not auto-revert ${SHA:0:7}" \
+              --body "Revert had conflicts. Manual intervention needed. RCA: ${{ steps.rca.outputs.reason }}"
+          fi
+
+      # Always: open an RCA issue for the record (every strategy).
+      - name: Open RCA issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create \
+            --title "🔍 RCA: CI failed on ${{ github.event.workflow_run.head_branch }} (${{ steps.rca.outputs.category }})" \
+            --body "$(printf 'Failed run: %s\n\nStrategy: %s\nCategory: %s\nReason: %s\n' \
+              '${{ github.event.workflow_run.html_url }}' \
+              '${{ steps.rca.outputs.strategy }}' \
+              '${{ steps.rca.outputs.category }}' \
+              '${{ steps.rca.outputs.reason }}')" || echo "issue create skipped"
