@@ -1,7 +1,5 @@
 name: Chaos (demo trigger)
 
-# Manually injects a failure so the audience can watch the pipeline detect and heal it.
-# Run from the Actions tab -> Chaos -> Run workflow -> pick a failure type.
 on:
   workflow_dispatch:
     inputs:
@@ -10,7 +8,7 @@ on:
         type: choice
         required: true
         options:
-          - flaky        # -> heal: rerun
+          - flaky        # toggle: run again to clean up
           - lint         # -> heal: fix_forward
           - dependency   # -> heal: revert
           - bug          # -> heal: revert
@@ -33,19 +31,38 @@ jobs:
         run: |
           case "${{ github.event.inputs.failure_type }}" in
             flaky)
-              mkdir -p chaos && echo "on" > chaos/flaky.on
-              git add chaos/flaky.on
-              git commit -m "chaos: enable flaky test"
+              if [ -f chaos/flaky.on ]; then
+                git rm chaos/flaky.on
+                git commit -m "chaos: disable flaky test (toggle off)"
+                echo "::notice::Flaky flag was already set — toggled OFF (cleanup)."
+              else
+                mkdir -p chaos && echo "on" > chaos/flaky.on
+                git add chaos/flaky.on
+                git commit -m "chaos: enable flaky test"
+                echo "::notice::Flaky flag toggled ON."
+              fi
               ;;
             lint)
+              if grep -q "badly_formatted" app/main.py; then
+                echo "::warning::Lint chaos already injected — merge or revert the heal PR first."
+                exit 0
+              fi
               printf '\n\ndef   badly_formatted( ):\n  x=1;y=2\n  return x+y\n' >> app/main.py
               git commit -am "chaos: introduce lint violation"
               ;;
             dependency)
+              if grep -q "fastapi==999" requirements.txt; then
+                echo "::warning::Dependency chaos already injected — merge the revert PR first."
+                exit 0
+              fi
               sed -i 's/^fastapi==.*/fastapi==999.999.999/' requirements.txt
               git commit -am "chaos: pin nonexistent dependency version"
               ;;
             bug)
+              if grep -q '"status": "BROKEN"' app/main.py; then
+                echo "::warning::Bug chaos already injected — merge the revert PR first."
+                exit 0
+              fi
               sed -i 's/"status": "ok"/"status": "BROKEN"/' app/main.py
               git commit -am "chaos: introduce failing behaviour"
               ;;
